@@ -1,189 +1,116 @@
 package main
 
 import (
-	"flag"
-	"fmt"
-	"io"
 	"net"
-	"os"
+	"strings"
 )
 
-type Client struct {
-	ServerIp string
-	ServerPort int
-	Name 	string
-	conn 	net.Conn
-	flag 	int
+type User struct {
+	Name string
+	Addr string
+	C	chan string
+	conn net.Conn
+	server *Server
 }
 
-func NewClient(serverIp string,serverPort int) *Client{
-	//创建客户端对象
-	client := &Client{
-		ServerIp:   serverIp,
-		ServerPort: serverPort,
-		flag: 		999,
-	}
-	//链接server
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", serverIp, serverPort))
-	if err != nil{
-		fmt.Println("net.Dial error:", err)
-	}
-	client.conn = conn
-	//返回对象
-	return client
-}
+//创建一个用户的API
+func NewUser(conn net.Conn, server *Server) *User{
+	userAddr := conn.RemoteAddr().String()
 
-func (client *Client) UpdateName() bool{
+	user := &User{
+		Name: userAddr,
+		Addr: userAddr,
+		C:    make(chan string),
+		conn: conn,
 
-	fmt.Println(">>>>请输入用户名:")
-	fmt.Scanln(&client.Name)
-
-	sendMsg := "rename|" + client.Name + "\n"
-	_, err := client.conn.Write([]byte(sendMsg))
-	if err != nil{
-		fmt.Println("conn.Write error:", err)
-		return false
+		server:server,
 	}
 
-	return true
+	//启动监听user channel消息的goroutine
+	go user.ListenMessage()
+
+	return user
 }
 
-
-//处理server回应的消息
-func (client *Client) DealResponse(){
-	io.Copy(os.Stdout, client.conn)
+//用户上线
+func(this *User) Online(){
+	//用户上线，将用户加入onlinemap中
+	this.server.mapLock.Lock()
+	defer this.server.mapLock.Unlock()
+	this.server.onlineMap[this.Name] = this
+	//广播用户上线
+	this.server.BoardCast(this, "已上线")
+}
+//用户下线
+func(this *User) Offline(){
+	//用户下线，将用户加入onlinemap中
+	this.server.mapLock.Lock()
+	defer this.server.mapLock.Unlock()
+	delete(this.server.onlineMap, this.Name)
+	//广播用户下线
+	this.server.BoardCast(this, "下线")
 }
 
-
-func (client *Client) menu() bool{
-	var flag int
-
-	fmt.Println("1.公聊模式")
-	fmt.Println("2.私聊模式")
-	fmt.Println("3.修改用户名")
-	fmt.Println("0.退出")
-
-	fmt.Scanln(&flag)
-
-	if flag >= 0 && flag <= 3{
-		client.flag = flag
-		return true
-	}else{
-		fmt.Println(">>>>>请输入合法的数字")
-		return false
-	}
+func (this *User) SendMsg(msg string){
+	this.conn.Write([]byte(msg))
 }
 
-func (client *Client) Run(){
-	for client.flag != 0{
-		for client.menu() != true{
+//处理业务
+func(this *User) DoMessage(msg string){
+	if msg == "who"{
+		//查询当前用户都有哪些
+		this.server.mapLock.Lock()
+		defer this.server.mapLock.Unlock()
+		for _, user := range this.server.onlineMap{
+			onlineMsg := "[" + user.Addr + "]" + user.Name + ":" + "在线...\n"
+			this.SendMsg(onlineMsg)
 		}
+	} else if len(msg) > 7 && msg[:7] == "rename|"{
+		//消息格式：rename|张三
+		newName := strings.Split(msg, "|")[1]
 
-		switch client.flag {
-		case 1:
-			fmt.Println("公聊模式选择...")
-			client.PublicChat()
-			break
-		case 2:
-			fmt.Println("私聊模式选择...")
-			client.PrivateChat()
-			break
-		case 3:
-			fmt.Println("修改用户名选择...")
-			client.UpdateName()
-			break
+		//判断name是否被占用
+		if _, ok := this.server.onlineMap[newName]; ok{
+			this.SendMsg("用户名已存在")
+			return
+		}else{
+			this.server.mapLock.Lock()
+			delete(this.server.onlineMap, this.Name)
+			this.server.onlineMap[newName] = this
+			defer this.server.mapLock.Unlock()
+
+			this.Name = newName
+			this.SendMsg("您已经更新用户名"+this.Name+"\n")
 		}
-	}
-}
+	} else if len(msg) > 4 && msg[:3] == "to|"{
+		//消息格式： to|张三|消息内容
 
-var (
-	serverIp string
-	serverPort int
-)
-
-
-func init(){
-	flag.StringVar(&serverIp, "ip", "127.0.0.1", "设置服务器IP地址(默认127.0.0.1)")
-	flag.IntVar(&serverPort, "port", 8888, "设置服务器端口地址(默认8888)")
-}
-
-func main(){
-	//命令行解析
-	flag.Parse()
-
-	client := NewClient(serverIp, serverPort)
-	if client == nil{
-		fmt.Println(">>>>>链接服务器失败...")
-		return
-	}
-
-
-	go client.DealResponse()
-
-	fmt.Println(">>>>>链接服务器成功...")
-
-	client.Run()
-}
-
-
-
-
-func (client *Client) PublicChat(){
-	var chatMsg string
-
-	fmt.Println("请输入内容，exit退出")
-	fmt.Scanln(&chatMsg)
-
-	for chatMsg != "exit"{
-		if len(chatMsg) != 0{
-			sendMsg := chatMsg + "\n"
-			_, err := client.conn.Write([]byte(sendMsg))
-			if err != nil{
-				fmt.Println("conn write error:", err)
-				break
-			}
+		//1. 获取对方用户名
+		remoteName := strings.Split(msg, "|")[1]
+		if remoteName == ""{
+			this.SendMsg("消息格式不正确，请使用\"to|张三|你好\"格式。\n")
 		}
-		chatMsg = ""
-		fmt.Println("请输入内容，exit退出")
-		fmt.Scanln(&chatMsg)
-	}
-}
-
-func (client *Client) SelectUsers(){
-	sendMsg := "who\n"
-	_, err := client.conn.Write([]byte(sendMsg))
-	if err != nil{
-		fmt.Println("conn write error:", err)
-		return
-	}
-}
-
-func (client *Client) PrivateChat(){
-	var remoteName string
-	var chatMsg string
-	client.SelectUsers()
-	fmt.Println(">>>>请输入聊天对象[用户名]， exit退出")
-	fmt.Scanln(&remoteName)
-
-	for remoteName != "exit"{
-		fmt.Println(">>>>请输入，exit退出：")
-		fmt.Scanln(&chatMsg)
-
-		for chatMsg != "exit" {
-			if len(chatMsg) != 0 {
-				sendMsg := "to|" + remoteName + "|" + chatMsg + "\n\n"
-				_, err := client.conn.Write([]byte(sendMsg))
-				if err != nil {
-					fmt.Println("conn write error:", err)
-					break
-				}
-			}
-			chatMsg = ""
-			fmt.Println(">>>>请输入，exit退出：")
-			fmt.Scanln(&chatMsg)
+		//2. 根据用户名 得到对方User对象
+		remoteUser, ok := this.server.onlineMap[remoteName]
+		if !ok{
+			this.SendMsg("该用户不存在\n")
+			return
 		}
-		client.SelectUsers()
-		fmt.Println(">>>>请输入聊天对象[用户名]， exit退出")
-		fmt.Scanln(&remoteName)
+		//3. 根据消息内容，通过对方的User对象将消息内容发送
+		content := strings.Split(msg, "|")[2]
+		if content == ""{
+			this.SendMsg("请重发")
+		}
+		remoteUser.SendMsg(this.Name+ "说："+ content)
+	}
+	this.server.BoardCast(this, msg)
+}
+
+
+//监听当前user channel的方法
+func (this *User) ListenMessage(){
+	for{
+		msg := <- this.C
+		this.conn.Write([]byte(msg+"\n"))
 	}
 }
