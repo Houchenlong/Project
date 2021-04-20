@@ -1,189 +1,127 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"io"
 	"net"
-	"os"
+	"sync"
+	"time"
 )
 
-type Client struct {
-	ServerIp string
-	ServerPort int
-	Name 	string
-	conn 	net.Conn
-	flag 	int
+type Server struct {
+	Ip string
+	Port int
+
+	//在线用户列表
+	onlineMap map[string]*User
+	mapLock	sync.RWMutex
+
+	//消息广播的channel
+	Message chan string
 }
 
-func NewClient(serverIp string,serverPort int) *Client{
-	//创建客户端对象
-	client := &Client{
-		ServerIp:   serverIp,
-		ServerPort: serverPort,
-		flag: 		999,
+//创建一个server函数
+func NewServer(ip string, port int) *Server{
+	server := &Server{
+		Ip:   ip,
+		Port: port,
+		onlineMap:make(map[string]*User),
+		Message:make(chan string),
 	}
-	//链接server
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", serverIp, serverPort))
+	return server
+}
+
+//监听Message广播消息channel的goroutine
+func(this *Server) ListenMessager(){
+	for{
+		msg := <- this.Message
+
+		this.mapLock.Lock()
+		defer this.mapLock.Unlock()
+		for _, cli := range this.onlineMap{
+			cli.C <- msg
+		}
+	}
+}
+
+//广播方法
+func(this *Server) BoardCast(user *User, msg string){
+	sendMsg := "[" + user.Addr + "]" + user.Name + ":" + msg
+
+	this.Message <- sendMsg
+}
+
+
+func (this *Server)Handler(conn net.Conn){
+
+	user := NewUser(conn, this)
+	//用户上线，将用户加入onlinemap中
+	user.Online()
+
+
+	//监听用户是否活跃的channel
+	isLive := make(chan bool)
+
+	//接受客户端消息
+	go func() {
+		buf := make([]byte, 4096)
+		n, err := conn.Read(buf)
+		if n == 0{
+			user.Offline()
+			return
+		}
+		if err != nil && err != io.EOF{
+			fmt.Println("conn read error:", err)
+		}
+
+		msg := string(buf[:n-1])
+
+		//用户针对msg进行处理
+		user.DoMessage(msg)
+
+		//用户任意消息
+		isLive <- true
+	}()
+
+
+	for{
+		select {
+		case <- isLive:
+			//当前用户活跃，重置定时器
+		case <- time.After(time.Second*10):
+			//已经超时，将当前user踢掉
+			user.SendMsg("你被踢了")
+			//销毁资源
+			close(user.C)
+			//关闭连接
+			conn.Close()
+			//退出handler
+			return
+		}
+	}
+
+}
+
+//启动服务器的方法
+func (this *Server) Start(){
+	//socket listen
+	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", this.Ip, this.Port))
 	if err != nil{
-		fmt.Println("net.Dial error:", err)
+		fmt.Println("net.listen error:", err)
 	}
-	client.conn = conn
-	//返回对象
-	return client
-}
+	//close listen socket
+	defer listener.Close()
 
-func (client *Client) UpdateName() bool{
+	//启动监听message的goroutine
+	go this.ListenMessager()
 
-	fmt.Println(">>>>请输入用户名:")
-	fmt.Scanln(&client.Name)
-
-	sendMsg := "rename|" + client.Name + "\n"
-	_, err := client.conn.Write([]byte(sendMsg))
-	if err != nil{
-		fmt.Println("conn.Write error:", err)
-		return false
-	}
-
-	return true
-}
-
-
-//处理server回应的消息
-func (client *Client) DealResponse(){
-	io.Copy(os.Stdout, client.conn)
-}
-
-
-func (client *Client) menu() bool{
-	var flag int
-
-	fmt.Println("1.公聊模式")
-	fmt.Println("2.私聊模式")
-	fmt.Println("3.修改用户名")
-	fmt.Println("0.退出")
-
-	fmt.Scanln(&flag)
-
-	if flag >= 0 && flag <= 3{
-		client.flag = flag
-		return true
-	}else{
-		fmt.Println(">>>>>请输入合法的数字")
-		return false
-	}
-}
-
-func (client *Client) Run(){
-	for client.flag != 0{
-		for client.menu() != true{
+	for{
+		//accept
+		conn, err := listener.Accept()
+		if err != nil{
+			fmt.Println("conn accept error:", err)
 		}
-
-		switch client.flag {
-		case 1:
-			fmt.Println("公聊模式选择...")
-			client.PublicChat()
-			break
-		case 2:
-			fmt.Println("私聊模式选择...")
-			client.PrivateChat()
-			break
-		case 3:
-			fmt.Println("修改用户名选择...")
-			client.UpdateName()
-			break
-		}
-	}
-}
-
-var (
-	serverIp string
-	serverPort int
-)
-
-
-func init(){
-	flag.StringVar(&serverIp, "ip", "127.0.0.1", "设置服务器IP地址(默认127.0.0.1)")
-	flag.IntVar(&serverPort, "port", 8888, "设置服务器端口地址(默认8888)")
-}
-
-func main(){
-	//命令行解析
-	flag.Parse()
-
-	client := NewClient(serverIp, serverPort)
-	if client == nil{
-		fmt.Println(">>>>>链接服务器失败...")
-		return
-	}
-
-
-	go client.DealResponse()
-
-	fmt.Println(">>>>>链接服务器成功...")
-
-	client.Run()
-}
-
-
-
-
-func (client *Client) PublicChat(){
-	var chatMsg string
-
-	fmt.Println("请输入内容，exit退出")
-	fmt.Scanln(&chatMsg)
-
-	for chatMsg != "exit"{
-		if len(chatMsg) != 0{
-			sendMsg := chatMsg + "\n"
-			_, err := client.conn.Write([]byte(sendMsg))
-			if err != nil{
-				fmt.Println("conn write error:", err)
-				break
-			}
-		}
-		chatMsg = ""
-		fmt.Println("请输入内容，exit退出")
-		fmt.Scanln(&chatMsg)
-	}
-}
-
-func (client *Client) SelectUsers(){
-	sendMsg := "who\n"
-	_, err := client.conn.Write([]byte(sendMsg))
-	if err != nil{
-		fmt.Println("conn write error:", err)
-		return
-	}
-}
-
-func (client *Client) PrivateChat(){
-	var remoteName string
-	var chatMsg string
-	client.SelectUsers()
-	fmt.Println(">>>>请输入聊天对象[用户名]， exit退出")
-	fmt.Scanln(&remoteName)
-
-	for remoteName != "exit"{
-		fmt.Println(">>>>请输入，exit退出：")
-		fmt.Scanln(&chatMsg)
-
-		for chatMsg != "exit" {
-			if len(chatMsg) != 0 {
-				sendMsg := "to|" + remoteName + "|" + chatMsg + "\n\n"
-				_, err := client.conn.Write([]byte(sendMsg))
-				if err != nil {
-					fmt.Println("conn write error:", err)
-					break
-				}
-			}
-			chatMsg = ""
-			fmt.Println(">>>>请输入，exit退出：")
-			fmt.Scanln(&chatMsg)
-		}
-		client.SelectUsers()
-		fmt.Println(">>>>请输入聊天对象[用户名]， exit退出")
-		fmt.Scanln(&remoteName)
+		//do  handler
+		go this.Handler(conn)
 	}
 }
